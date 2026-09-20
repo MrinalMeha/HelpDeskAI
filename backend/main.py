@@ -26,13 +26,8 @@ from agent.tools import (
     get_user_tickets as tool_get_user_tickets,
 )
 from agent.prompts import TICKET_SUMMARY_PROMPT
-from agent.graph import (
-    classify_issue,
-    retrieve_knowledge,
-    ask_diagnostic_question,
-    process_user_response,
-    _parse_json_response,
-)
+from agent.graph import process_agent_turn, _parse_json_response
+from agent.tools import update_ticket_status
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 # Configure logging
@@ -85,6 +80,7 @@ DEMO_USER = {
 class ChatRequest(BaseModel):
     message: str
     session_id: str = "demo-session"
+    message_id: str = "" 
 
 
 class ChatResponse(BaseModel):
@@ -116,20 +112,18 @@ def get_session(session_id: str) -> dict:
     if session_id not in SESSION_STORE:
         SESSION_STORE[session_id] = {
             "messages": [],
+            "last_processed_message_id": "",
             "issue_description": "",
             "issue_category": "",
             "severity": "",
+            "completed_steps": [],
+            "attempted_steps": [],
             "knowledge_base_content": "",
-            "troubleshooting_steps": [],
-            "current_question": "",
-            "questions_asked": 0,
-            "resolved": False,
-            "resolution_attempts": 0,
-            "max_attempts": 5,
+            "current_step": "",
+            "ticket_status": "OPEN",
             "ticket_id": None,
             "agent_activity": [],
             "workflow_stage": "start",
-            "awaiting_user_response": False,
         }
     return SESSION_STORE[session_id]
 
@@ -144,6 +138,7 @@ def save_session(session_id: str, state: dict):
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest, db: Session = Depends(get_db)):
     session_id = request.session_id
+    message_id = request.message_id
     user_message = request.message.strip()
 
     if not user_message:
@@ -159,153 +154,67 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
         )
 
     state = get_session(session_id)
-
-    # Add user message to state
-    state["messages"].append(HumanMessage(content=user_message))
-
-    workflow_stage = state.get("workflow_stage", "start")
-
-    try:
-        # ------------------------------------------------------------------- #
-        # STAGE: START — First message, classify issue                         #
-        # ------------------------------------------------------------------- #
-        if workflow_stage == "start":
-            state["issue_description"] = user_message
-            state["agent_activity"] = []
-
-            # Run classify
-            state = classify_issue(state)
-            # Run retrieve
-            state = retrieve_knowledge(state)
-            # Ask first question
-            state = ask_diagnostic_question(state)
-
-            question = state.get("current_question", "")
-
-            # Build friendly response
-            category = state.get("issue_category", "")
-            response_msg = (
-                f"I've identified this as a **{category}** issue. Let's troubleshoot it together.\n\n"
-                f"{question}"
-            )
-
-            state["messages"].append(AIMessage(content=response_msg))
-            save_session(session_id, state)
-
-            return ChatResponse(
-                message=response_msg,
-                status="diagnosing",
-                issue_category=category,
-                severity=state.get("severity"),
-                agent_activity=state.get("agent_activity", []),
-                ticket_id=None,
-                session_id=session_id,
-            )
-
-        # ------------------------------------------------------------------- #
-        # STAGE: DIAGNOSING — User answered a diagnostic question              #
-        # ------------------------------------------------------------------- #
-        elif workflow_stage == "diagnose" and state.get("awaiting_user_response"):
-            # Process user's response to last question
-            state["awaiting_user_response"] = False
-            state = process_user_response(state)
-
-            # Check if we should create a ticket
-            if state.get("workflow_stage") == "create_ticket":
-                return await _create_ticket_response(state, session_id, db)
-
-            if state.get("resolved"):
-                return _resolved_response(state, session_id)
-
-            # Ask next diagnostic question
-            state = ask_diagnostic_question(state)
-
-            if state.get("workflow_stage") == "create_ticket":
-                return await _create_ticket_response(state, session_id, db)
-
-            if state.get("resolved"):
-                return _resolved_response(state, session_id)
-
-            question = state.get("current_question", "")
-            response_msg = question
-
-            state["messages"].append(AIMessage(content=response_msg))
-            save_session(session_id, state)
-
-            return ChatResponse(
-                message=response_msg,
-                status="diagnosing",
-                issue_category=state.get("issue_category"),
-                severity=state.get("severity"),
-                agent_activity=state.get("agent_activity", []),
-                ticket_id=None,
-                session_id=session_id,
-            )
-
-        # ------------------------------------------------------------------- #
-        # STAGE: TICKET CREATED — issue with new conversation                  #
-        # ------------------------------------------------------------------- #
-        elif state.get("ticket_id") or workflow_stage in ("done", "resolved"):
-            # Start fresh conversation
-            SESSION_STORE[session_id] = {
-                "messages": [HumanMessage(content=user_message)],
-                "issue_description": user_message,
-                "issue_category": "",
-                "severity": "",
-                "knowledge_base_content": "",
-                "troubleshooting_steps": [],
-                "current_question": "",
-                "questions_asked": 0,
-                "resolved": False,
-                "resolution_attempts": 0,
-                "max_attempts": 5,
-                "ticket_id": None,
-                "agent_activity": [],
-                "workflow_stage": "start",
-                "awaiting_user_response": False,
-            }
-            state = SESSION_STORE[session_id]
-
-            state = classify_issue(state)
-            state = retrieve_knowledge(state)
-            state = ask_diagnostic_question(state)
-
-            question = state.get("current_question", "")
-            category = state.get("issue_category", "")
-            response_msg = (
-                f"I've identified this as a **{category}** issue. Let's troubleshoot it together.\n\n"
-                f"{question}"
-            )
-
-            state["messages"].append(AIMessage(content=response_msg))
-            save_session(session_id, state)
-
-            return ChatResponse(
-                message=response_msg,
-                status="diagnosing",
-                issue_category=category,
-                severity=state.get("severity"),
-                agent_activity=state.get("agent_activity", []),
-                session_id=session_id,
-            )
-
-        else:
-            # Fallback for unexpected state
-            save_session(session_id, state)
-            return ChatResponse(
-                message="I'm ready to help with your IT issue. Please describe the problem you're experiencing.",
-                status="greeting",
-                session_id=session_id,
-            )
-
-    except ValueError as e:
-        logger.error(f"Config error: {e}")
+    
+    # Idempotency check
+    if message_id and state.get("last_processed_message_id") == message_id:
+        # Return the last state without re-processing
+        last_msg = state["messages"][-1].content if state["messages"] else "Processing..."
         return ChatResponse(
-            message=f"⚠️ Configuration error: {str(e)}",
-            status="error",
+            message=last_msg,
+            status=state["workflow_stage"] if state["workflow_stage"] in ["error", "resolved", "start"] else "diagnosing",
+            issue_category=state.get("issue_category"),
+            severity=state.get("severity"),
+            agent_activity=state.get("agent_activity", []),
+            ticket_id=state.get("ticket_id"),
             session_id=session_id,
-            agent_activity=["⚠ Configuration error — check API key"],
         )
+
+    # If ticket was already created or resolved and user sends new msg, reset
+    if state.get("ticket_id") or state.get("workflow_stage") in ("resolved", "done"):
+        state = {
+            "messages": [],
+            "last_processed_message_id": message_id,
+            "issue_description": "",
+            "issue_category": "",
+            "severity": "",
+            "completed_steps": [],
+            "attempted_steps": [],
+            "knowledge_base_content": "",
+            "current_step": "",
+            "ticket_status": "OPEN",
+            "ticket_id": None,
+            "agent_activity": [],
+            "workflow_stage": "start",
+        }
+        SESSION_STORE[session_id] = state
+
+    # Process Agent Turn
+    try:
+        state["last_processed_message_id"] = message_id
+        state = process_agent_turn(state, user_message)
+        
+        # Check output state
+        if state["workflow_stage"] == "escalated":
+            return await _create_ticket_response(state, session_id, db)
+        elif state["workflow_stage"] == "resolved":
+            # Update ticket if exists
+            if state.get("ticket_id"):
+                update_ticket_status(db, state["ticket_id"], "RESOLVED")
+            return _resolved_response(state, session_id)
+        
+        # Default: troubleshooting continues
+        last_ai_msg = state["messages"][-1].content
+        save_session(session_id, state)
+        return ChatResponse(
+            message=last_ai_msg,
+            status="diagnosing",
+            issue_category=state.get("issue_category"),
+            severity=state.get("severity"),
+            agent_activity=state.get("agent_activity", []),
+            ticket_id=state.get("ticket_id"),
+            session_id=session_id,
+        )
+
     except Exception as e:
         logger.error(f"Chat error: {e}", exc_info=True)
         return ChatResponse(
@@ -315,16 +224,14 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
             agent_activity=state.get("agent_activity", []) + [f"⚠ Error: {str(e)[:60]}"],
         )
 
+# Remove old unused routes / block logic
 
-# --------------------------------------------------------------------------- #
-# Helper: Create ticket response                                               #
-# --------------------------------------------------------------------------- #
 async def _create_ticket_response(state: dict, session_id: str, db: Session) -> ChatResponse:
     activity = list(state.get("agent_activity", []))
     activity.append("⟳ Generating ticket summary...")
 
     # Generate ticket summary via LLM
-    diagnostics = state.get("troubleshooting_steps", [])
+    diagnostics = state.get("completed_steps", [])
     diag_text = "\n".join(
         [f"- {s['step']}: {s['result']}" for s in diagnostics]
     ) if diagnostics else "No specific diagnostics recorded."

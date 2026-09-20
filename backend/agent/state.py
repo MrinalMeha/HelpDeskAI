@@ -8,6 +8,9 @@ class AgentState(TypedDict):
     """Complete state maintained throughout the agent workflow."""
     # Conversation messages (LangChain messages)
     messages: Annotated[list, add_messages]
+    
+    # Idempotency
+    last_processed_message_id: str
 
     # Issue details
     issue_description: str
@@ -15,22 +18,17 @@ class AgentState(TypedDict):
     severity: str             # Low, Medium, High, Critical
 
     # Troubleshooting state
-    troubleshooting_steps: list[dict]   # [{"step": ..., "result": ...}]
+    completed_steps: list[dict]         # [{"step": ..., "result": ...}]
+    attempted_steps: list[str]          # ["step1", "step2"]
     knowledge_base_content: str         # Relevant KB content retrieved
-    current_question: str               # The current diagnostic question asked
-    questions_asked: int                # Count of questions asked
+    current_step: str                   # The current diagnostic step being asked
 
     # Resolution state
-    resolved: bool
-    resolution_attempts: int
-    max_attempts: int
-
-    # Ticket
+    ticket_status: str                  # OPEN, IN_PROGRESS, WAITING_FOR_USER, RESOLVED, ESCALATED
     ticket_id: str | None
 
     # UI Activity log
     agent_activity: list[str]
 
     # Flow control
-    workflow_stage: str  # classify | retrieve | diagnose | check_resolution | create_ticket | done
-    awaiting_user_response: bool
+    workflow_stage: str                 # start | troubleshooting | resolved | escalated | error

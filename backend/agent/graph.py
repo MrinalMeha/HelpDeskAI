@@ -1,27 +1,5 @@
 """
-LangGraph workflow graph for the HelpDeskAI agent.
-
-Graph flow:
-  START
-    ↓
-  classify_issue          ← Understand & classify the IT issue
-    ↓
-  retrieve_knowledge      ← Search knowledge base for relevant info
-    ↓
-  ask_diagnostic_question ← Generate next diagnostic question
-    ↓  (returns to frontend to wait for user reply)
-  [USER RESPONDS]
-    ↓
-  process_user_response   ← Record diagnostic result & check resolution
-    ↓
-  ┌─────────────────────┐
-  │                     │
-resolved             unresolved
-  │                     │
-  ↓                     ↓
-  done            create_ticket_node
-                        ↓
-                       done
+Agent logic for the HelpDeskAI agent.
 """
 import json
 import logging
@@ -29,20 +7,15 @@ import os
 from typing import Literal
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langgraph.graph import StateGraph, END
+from langchain_core.messages import HumanMessage, AIMessage
 
 from agent.state import AgentState
-from agent.prompts import (
-    CLASSIFY_PROMPT,
-    DIAGNOSTIC_QUESTION_PROMPT,
-    RECORD_AND_DECIDE_PROMPT,
-)
-from agent.tools import search_knowledge_base, record_diagnostic
+from agent.prompts import CLASSIFY_PROMPT
+from agent.tools import search_knowledge_base
 
 logger = logging.getLogger(__name__)
 
 MAX_DIAGNOSTIC_QUESTIONS = 5
-
 
 def _get_llm():
     """Create the LLM instance."""
@@ -56,14 +29,7 @@ def _get_llm():
         temperature=0.2,
     )
 
-
 def _extract_text(content) -> str:
-    """Normalize LLM response content to a plain string.
-
-    Newer versions of langchain-google-genai return content as a list of
-    dicts (e.g. [{'type': 'text', 'text': '...'}]) rather than a plain str.
-    This helper handles both formats.
-    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -76,14 +42,10 @@ def _extract_text(content) -> str:
         return "".join(parts)
     return str(content)
 
-
 def _parse_json_response(content) -> dict:
-    """Safely parse JSON from LLM response, stripping markdown fences if present."""
     text = _extract_text(content).strip()
-    # Remove markdown code fences if present
     if text.startswith("```"):
         lines = text.split("\n")
-        # Remove first and last fence lines
         text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
     try:
         return json.loads(text)
@@ -91,28 +53,8 @@ def _parse_json_response(content) -> dict:
         logger.error(f"JSON parse error: {e}\nRaw text: {text}")
         return {}
 
-
-# --------------------------------------------------------------------------- #
-# Node 1: Classify Issue                                                       #
-# --------------------------------------------------------------------------- #
-def classify_issue(state: AgentState) -> AgentState:
-    """Classify the IT issue from the initial employee message."""
-    activity = list(state.get("agent_activity", []))
-    activity.append("⟳ Analyzing your issue...")
-
-    # Get the latest human message
-    messages = state.get("messages", [])
-    last_human = ""
-    for msg in reversed(messages):
-        if hasattr(msg, "type") and msg.type == "human":
-            last_human = msg.content
-            break
-        elif isinstance(msg, dict) and msg.get("role") == "human":
-            last_human = msg.get("content", "")
-            break
-
-    issue_desc = state.get("issue_description", last_human)
-
+def classify_issue(issue_desc: str) -> dict:
+    """Classify the IT issue."""
     try:
         llm = _get_llm()
         prompt = CLASSIFY_PROMPT.format(message=issue_desc)
@@ -122,329 +64,112 @@ def classify_issue(state: AgentState) -> AgentState:
         category = parsed.get("category", "Application")
         severity = parsed.get("severity", "Medium")
         description = parsed.get("description", issue_desc)
-
-        activity.append(f"✓ Issue identified: {category} ({severity} priority)")
-        logger.info(f"Classified issue: category={category}, severity={severity}")
-
-        return {
-            **state,
-            "issue_category": category,
-            "severity": severity,
-            "issue_description": description,
-            "workflow_stage": "retrieve",
-            "agent_activity": activity,
-            "awaiting_user_response": False,
-        }
+        return {"category": category, "severity": severity, "description": description}
     except Exception as e:
         logger.error(f"Classification error: {e}")
-        activity.append("⚠ Classification encountered an error, defaulting to general IT issue")
-        return {
-            **state,
-            "issue_category": "Application",
-            "severity": "Medium",
-            "issue_description": issue_desc,
-            "workflow_stage": "retrieve",
-            "agent_activity": activity,
-            "awaiting_user_response": False,
-        }
+        return {"category": "Application", "severity": "Medium", "description": issue_desc}
 
-
-# --------------------------------------------------------------------------- #
-# Node 2: Retrieve Knowledge                                                   #
-# --------------------------------------------------------------------------- #
-def retrieve_knowledge(state: AgentState) -> AgentState:
-    """Search the knowledge base for relevant troubleshooting information."""
-    activity = list(state.get("agent_activity", []))
-    category = state.get("issue_category", "")
-    description = state.get("issue_description", "")
-
-    activity.append(f"⟳ Retrieving {category} troubleshooting guide...")
-
+def retrieve_knowledge(category: str, description: str) -> str:
+    """Search the knowledge base."""
     try:
-        kb_content = search_knowledge_base(query=description, category=category)
-        activity.append(f"✓ Retrieved {category} troubleshooting procedure")
-        logger.info(f"KB content retrieved, length={len(kb_content)}")
+        return search_knowledge_base(query=description, category=category)
     except Exception as e:
         logger.error(f"KB retrieval error: {e}")
-        kb_content = "General IT troubleshooting: restart the device, check network, and verify credentials."
-        activity.append("⚠ Could not load specific guide, using general procedure")
+        return "General IT troubleshooting: restart the device, check network, and verify credentials."
 
-    return {
-        **state,
-        "knowledge_base_content": kb_content,
-        "workflow_stage": "diagnose",
-        "agent_activity": activity,
-    }
-
-
-# --------------------------------------------------------------------------- #
-# Node 3: Ask Diagnostic Question                                              #
-# --------------------------------------------------------------------------- #
-def ask_diagnostic_question(state: AgentState) -> AgentState:
-    """Generate the next diagnostic question for the employee."""
+def process_agent_turn(state: AgentState, user_message: str) -> AgentState:
+    """Process a single turn of conversation using a structured LLM call."""
     activity = list(state.get("agent_activity", []))
-    questions_asked = state.get("questions_asked", 0)
+    
+    # 1. If first turn, classify and retrieve
+    if state["workflow_stage"] == "start":
+        activity.append("⟳ Analyzing your issue...")
+        classification = classify_issue(user_message)
+        state["issue_category"] = classification["category"]
+        state["severity"] = classification["severity"]
+        state["issue_description"] = classification["description"]
+        activity.append(f"✓ Issue identified: {state['issue_category']} ({state['severity']} priority)")
+        
+        activity.append(f"⟳ Retrieving {state['issue_category']} troubleshooting guide...")
+        state["knowledge_base_content"] = retrieve_knowledge(state["issue_category"], state["issue_description"])
+        activity.append(f"✓ Retrieved {state['issue_category']} troubleshooting procedure")
+        state["workflow_stage"] = "troubleshooting"
 
-    activity.append("⟳ Determining next troubleshooting step...")
+    # 2. Record the result of the previous step if applicable
+    if state["current_step"] and user_message:
+        state["completed_steps"].append({
+            "step": state["current_step"],
+            "result": user_message
+        })
 
-    # Build context from completed steps
-    completed_steps = state.get("troubleshooting_steps", [])
-    steps_text = "\n".join(
-        [f"- {s['step']}: {s['result']}" for s in completed_steps]
-    ) if completed_steps else "None yet."
+    # 3. Ask LLM for the next action
+    activity.append("⟳ Determining next step...")
+    
+    completed_steps_text = "\n".join(
+        [f"- {s['step']}: {s['result']}" for s in state.get("completed_steps", [])]
+    ) if state.get("completed_steps") else "None yet."
+    
+    attempted_steps_text = ", ".join(state.get("attempted_steps", [])) if state.get("attempted_steps") else "None"
 
-    # Get last user message
-    messages = state.get("messages", [])
-    last_response = ""
-    for msg in reversed(messages):
-        if hasattr(msg, "type") and msg.type == "human":
-            last_response = msg.content
-            break
-        elif isinstance(msg, dict) and msg.get("role") == "human":
-            last_response = msg.get("content", "")
-            break
+    AGENT_PROMPT = f"""You are an expert IT HelpDesk AI agent.
+Issue Category: {state['issue_category']}
+Issue Description: {state['issue_description']}
+
+Knowledge Base Guidelines:
+{state['knowledge_base_content']}
+
+Steps already completed by the user and their results:
+{completed_steps_text}
+
+Steps already attempted (do NOT suggest these again):
+{attempted_steps_text}
+
+Last user message:
+{user_message}
+
+Based on the conversation history, decide the next best action.
+If the user indicates the problem is fixed (e.g., "Yes that fixed it", "it works", "thank you"), mark intent as "RESOLVED".
+If you have tried multiple steps and it's still not working, mark intent as "ESCALATED".
+Otherwise, provide the NEXT troubleshooting step or question (intent: "ASK_USER"). Do not repeat steps already attempted.
+
+Respond ONLY with a JSON object in this format:
+{{
+  "intent": "ASK_USER" | "RESOLVED" | "ESCALATED",
+  "message": "The conversational message to show to the user",
+  "step_name": "A short summary of the step you are suggesting (if ASK_USER)"
+}}"""
 
     try:
         llm = _get_llm()
-        prompt = DIAGNOSTIC_QUESTION_PROMPT.format(
-            category=state.get("issue_category", "IT"),
-            description=state.get("issue_description", ""),
-            knowledge_base_content=state.get("knowledge_base_content", ""),
-            completed_steps=steps_text,
-            questions_asked=questions_asked,
-            max_questions=MAX_DIAGNOSTIC_QUESTIONS,
-            last_response=last_response,
-        )
-        response = llm.invoke(prompt)
+        response = llm.invoke(AGENT_PROMPT)
         parsed = _parse_json_response(response.content)
-
-        question = parsed.get("question", "Could you describe the exact error message you see?")
-        is_resolved = parsed.get("is_resolved", False)
-        should_escalate = parsed.get("should_escalate", False)
-        step_name = parsed.get("diagnostic_step_name", f"Diagnostic step {questions_asked + 1}")
-
-        if is_resolved:
-            activity.append("✓ Issue appears to be resolved!")
-            return {
-                **state,
-                "current_question": question,
-                "resolved": True,
-                "workflow_stage": "check_resolution",
-                "agent_activity": activity,
-                "awaiting_user_response": False,
-            }
-
-        if should_escalate or questions_asked >= MAX_DIAGNOSTIC_QUESTIONS:
+        
+        intent = parsed.get("intent", "ASK_USER")
+        message = parsed.get("message", "Could you provide more details?")
+        step_name = parsed.get("step_name", "Diagnostic step")
+        
+        if intent == "RESOLVED":
+            state["workflow_stage"] = "resolved"
+            state["ticket_status"] = "RESOLVED"
+            activity.append("✓ Issue successfully resolved!")
+            state["messages"].append(AIMessage(content=message))
+        elif intent == "ESCALATED" or len(state["completed_steps"]) >= MAX_DIAGNOSTIC_QUESTIONS:
+            state["workflow_stage"] = "escalated"
+            state["ticket_status"] = "ESCALATED"
             activity.append("✓ Troubleshooting steps exhausted — escalating to ticket")
-            return {
-                **state,
-                "current_question": question,
-                "resolved": False,
-                "workflow_stage": "create_ticket",
-                "agent_activity": activity,
-                "awaiting_user_response": False,
-            }
-
-        activity.append(f"✓ {step_name}")
-        return {
-            **state,
-            "current_question": question,
-            "questions_asked": questions_asked + 1,
-            "workflow_stage": "diagnose",
-            "agent_activity": activity,
-            "awaiting_user_response": True,
-        }
-
+            message = parsed.get("message", "I will escalate this to a ticket.")
+            state["messages"].append(AIMessage(content=message))
+        else:
+            state["workflow_stage"] = "troubleshooting"
+            state["current_step"] = step_name
+            if step_name not in state["attempted_steps"]:
+                state["attempted_steps"].append(step_name)
+            activity.append(f"✓ {step_name}")
+            state["messages"].append(AIMessage(content=message))
+            
     except Exception as e:
-        logger.error(f"Diagnostic question error: {e}")
-        fallback = "Could you please describe the exact error message or behavior you are seeing?"
-        return {
-            **state,
-            "current_question": fallback,
-            "questions_asked": questions_asked + 1,
-            "workflow_stage": "diagnose",
-            "agent_activity": activity,
-            "awaiting_user_response": True,
-        }
+        logger.error(f"Agent turn error: {e}")
+        state["messages"].append(AIMessage(content="I encountered an error. Could you describe the issue again?"))
 
-
-# --------------------------------------------------------------------------- #
-# Node 4: Process User Response                                                #
-# --------------------------------------------------------------------------- #
-def process_user_response(state: AgentState) -> AgentState:
-    """Record the user's response to the diagnostic question and decide next step."""
-    activity = list(state.get("agent_activity", []))
-
-    # Get last user message
-    messages = state.get("messages", [])
-    last_response = ""
-    for msg in reversed(messages):
-        if hasattr(msg, "type") and msg.type == "human":
-            last_response = msg.content
-            break
-        elif isinstance(msg, dict) and msg.get("role") == "human":
-            last_response = msg.get("content", "")
-            break
-
-    current_question = state.get("current_question", "")
-
-    try:
-        llm = _get_llm()
-        prompt = RECORD_AND_DECIDE_PROMPT.format(
-            description=state.get("issue_description", ""),
-            category=state.get("issue_category", "IT"),
-            step_name=current_question[:100],
-            employee_response=last_response,
-        )
-        response = llm.invoke(prompt)
-        parsed = _parse_json_response(response.content)
-
-        resolved = parsed.get("resolved", False)
-        step_result = parsed.get("step_result", last_response[:200])
-
-        # Record diagnostic via tool
-        updated_steps = record_diagnostic(
-            step=current_question,
-            result=step_result,
-            current_steps=state.get("troubleshooting_steps", []),
-        )
-
-        activity.append("✓ Recorded diagnostic result")
-
-        if resolved:
-            activity.append("✓ Issue resolved!")
-            return {
-                **state,
-                "troubleshooting_steps": updated_steps,
-                "resolved": True,
-                "workflow_stage": "check_resolution",
-                "agent_activity": activity,
-                "awaiting_user_response": False,
-            }
-
-        # Check if we've hit max questions
-        questions_asked = state.get("questions_asked", 0)
-        if questions_asked >= MAX_DIAGNOSTIC_QUESTIONS:
-            activity.append("✓ Troubleshooting steps exhausted")
-            return {
-                **state,
-                "troubleshooting_steps": updated_steps,
-                "resolved": False,
-                "workflow_stage": "create_ticket",
-                "agent_activity": activity,
-                "awaiting_user_response": False,
-            }
-
-        return {
-            **state,
-            "troubleshooting_steps": updated_steps,
-            "resolved": False,
-            "workflow_stage": "diagnose",
-            "agent_activity": activity,
-            "awaiting_user_response": False,
-        }
-
-    except Exception as e:
-        logger.error(f"Process response error: {e}")
-        updated_steps = record_diagnostic(
-            step=current_question,
-            result=last_response,
-            current_steps=state.get("troubleshooting_steps", []),
-        )
-        return {
-            **state,
-            "troubleshooting_steps": updated_steps,
-            "workflow_stage": "diagnose",
-            "agent_activity": activity,
-            "awaiting_user_response": False,
-        }
-
-
-# --------------------------------------------------------------------------- #
-# Routing Functions                                                            #
-# --------------------------------------------------------------------------- #
-def route_after_classify(state: AgentState) -> Literal["retrieve_knowledge"]:
-    return "retrieve_knowledge"
-
-
-def route_after_retrieve(state: AgentState) -> Literal["ask_diagnostic_question"]:
-    return "ask_diagnostic_question"
-
-
-def route_after_diagnostic(
-    state: AgentState,
-) -> Literal["done", "create_ticket_node", "ask_diagnostic_question"]:
-    stage = state.get("workflow_stage", "diagnose")
-    if state.get("resolved"):
-        return "done"
-    if stage == "create_ticket":
-        return "create_ticket_node"
-    # awaiting user response — the graph stops here (interrupt)
-    return "done"
-
-
-def route_after_process(
-    state: AgentState,
-) -> Literal["done", "create_ticket_node", "ask_diagnostic_question"]:
-    stage = state.get("workflow_stage", "diagnose")
-    if state.get("resolved"):
-        return "done"
-    if stage == "create_ticket":
-        return "create_ticket_node"
-    return "ask_diagnostic_question"
-
-
-# --------------------------------------------------------------------------- #
-# Ticket creation node (called from outside graph with db session)            #
-# --------------------------------------------------------------------------- #
-def prepare_ticket_creation(state: AgentState) -> AgentState:
-    """Prepare the state for ticket creation — the actual DB call is in main.py."""
-    activity = list(state.get("agent_activity", []))
-    activity.append("⟳ Creating IT support ticket...")
-    return {
-        **state,
-        "workflow_stage": "create_ticket",
-        "agent_activity": activity,
-        "awaiting_user_response": False,
-    }
-
-
-# --------------------------------------------------------------------------- #
-# Build the Graph                                                              #
-# --------------------------------------------------------------------------- #
-def build_graph():
-    """Build and compile the LangGraph workflow."""
-    builder = StateGraph(AgentState)
-
-    # Add nodes
-    builder.add_node("classify_issue", classify_issue)
-    builder.add_node("retrieve_knowledge", retrieve_knowledge)
-    builder.add_node("ask_diagnostic_question", ask_diagnostic_question)
-    builder.add_node("process_user_response", process_user_response)
-    builder.add_node("create_ticket_node", prepare_ticket_creation)
-
-    # Set entry point
-    builder.set_entry_point("classify_issue")
-
-    # Add edges
-    builder.add_edge("classify_issue", "retrieve_knowledge")
-    builder.add_edge("retrieve_knowledge", "ask_diagnostic_question")
-
-    builder.add_conditional_edges(
-        "ask_diagnostic_question",
-        route_after_diagnostic,
-        {
-            "done": END,
-            "create_ticket_node": "create_ticket_node",
-            "ask_diagnostic_question": "ask_diagnostic_question",
-        },
-    )
-
-    builder.add_edge("process_user_response", "ask_diagnostic_question")
-    builder.add_edge("create_ticket_node", END)
-
-    return builder.compile()
-
-
-# Global compiled graph instance
-graph = build_graph()
+    state["agent_activity"] = activity
+    return state

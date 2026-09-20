@@ -13,6 +13,7 @@ const SESSION_ID = 'demo-session-' + Math.random().toString(36).slice(2, 8)
 export function Dashboard() {
   const [messages, setMessages] = useState([])
   const [isLoading, setIsLoading] = useState(false)
+  const isRequesting = React.useRef(false)
   const [status, setStatus] = useState('greeting')
   const [issueCategory, setIssueCategory] = useState(null)
   const [severity, setSeverity] = useState(null)
@@ -28,15 +29,19 @@ export function Dashboard() {
   }
 
   const sendMessage = useCallback(async (text) => {
-    if (isLoading) return
-    addMessage('user', text)
+    if (isRequesting.current) return
+    isRequesting.current = true
     setIsLoading(true)
+    
+    const message_id = Date.now().toString(36) + Math.random().toString(36).slice(2)
+    
+    addMessage('user', text)
 
     try {
       const res = await fetch(`${API_BASE}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text, session_id: SESSION_ID }),
+        body: JSON.stringify({ message: text, session_id: SESSION_ID, message_id }),
       })
 
       if (!res.ok) {
@@ -63,6 +68,7 @@ export function Dashboard() {
       setStatus('error')
     } finally {
       setIsLoading(false)
+      isRequesting.current = false
     }
   }, [isLoading])
 

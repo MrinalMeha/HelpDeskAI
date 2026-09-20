@@ -198,3 +198,21 @@ def get_user_tickets(db: Session, employee_id: str = "EMP001") -> list[dict]:
             "created_at": t.created_at.isoformat() if t.created_at else None,
         })
     return result
+
+# --------------------------------------------------------------------------- #
+# Tool 6: Update Ticket Status                                                 #
+# --------------------------------------------------------------------------- #
+def update_ticket_status(db: Session, ticket_id: str, status: str) -> bool:
+    """Update the status of an existing ticket."""
+    try:
+        ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+        if ticket:
+            ticket.status = status
+            db.commit()
+            logger.info(f"Ticket {ticket_id} status updated to {status}")
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Failed to update ticket {ticket_id}: {e}")
+        db.rollback()
+        return False
